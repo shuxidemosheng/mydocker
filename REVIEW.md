@@ -215,7 +215,13 @@ sudo ./scripts/verify-stage5.sh   # run→ps→exec→rm 全链路
 
 ## 九、档案信息
 
+- **GitHub 仓库：https://github.com/shuxidemosheng/mydocker**
+  （公开，含完整按阶段提交历史与 tag `v0.1-stage5`，复试可放简历）
 - 归档：`D:\AIcoding\mydocker-backup-2026-09-28.tar.gz`（代码+文档+git 历史）
+- Windows 侧工作副本：`D:\AIcoding\mydocker`（已关联 origin）
 - 开发环境：Windows 11 + WSL2 Ubuntu 26.04，内核 6.18，cgroup v2，gcc 15
+- 推送链路：WSL 仓库 `core.sshCommand` 指向 Windows 的 ssh.exe
+  （`/mnt/c/Windows/System32/OpenSSH/ssh.exe`），走 ssh.github.com:443，
+  绕开 Steam++ 对 github.com 的 hosts 劫持；Windows 侧同名远程已配置
 - 六篇阶段笔记：`docs/00-stage0-env.md`（环境验证）
   `01-namespace` `02-rootfs` `03-cgroup` `04-net` `05-cli`
