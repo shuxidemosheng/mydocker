@@ -20,10 +20,19 @@
  */
 #define _GNU_SOURCE                     /* clone() 是 GNU 扩展，必须先定义这个宏 */
 #include "mydocker.h"
+#include "netlink.h"
+
+#ifdef NET_DEBUG
+#define DBG(...) do { fprintf(stderr, "[dbg %d] ", getpid()); \
+                      fprintf(stderr, __VA_ARGS__); fflush(stderr); } while (0)
+#else
+#define DBG(...) do {} while (0)
+#endif
 
 #include <errno.h>
 #include <fcntl.h>                      /* open() */
 #include <limits.h>                     /* PATH_MAX */
+#include <net/if.h>                     /* IFNAMSIZ, if_nametoindex() */
 #include <signal.h>                     /* kill(), SIGKILL */
 #include <sched.h>                      /* clone(), CLONE_NEWxxx */
 #include <stdio.h>
@@ -277,6 +286,8 @@ static int child_main(void *arg)
     /* 若启用了 User Namespace 或 cgroup 限额，父进程还需要做收尾工作
        （写 uid/gid 映射、把我们的 pid 写进 cgroup 组），
        读管道等它发"可以了"的信号，再继续干活。 */
+    /* 等父进程放行：veth 名字在 clone 前已写入结构体（clone 时随地址空间
+       一起复制，子进程天然可见），管道只传一个字节的"可以了"信号。 */
     {
         char done;
         if (read(o->sync_pipe[0], &done, 1) != 1) {
@@ -285,6 +296,7 @@ static int child_main(void *arg)
         }
     }
     close(o->sync_pipe[0]);
+    DBG("child: handshake done");
 
     /* 在新 UTS Namespace 里改主机名 —— 只改本 Namespace 的视角，
        宿主机的主机名不受影响。 */
@@ -303,10 +315,27 @@ static int child_main(void *arg)
             target = merged;
         }
         if (setup_rootfs(target) < 0) return 1;
+        DBG("child: rootfs done");
     } else if (o->ns_flags & CLONE_NEWPID) {
         if (mount("proc", "/proc", "proc",
                   MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0)
             perror("mydocker: mount /proc");
+    }
+
+    /* 6.5 容器侧网络自配（阶段 4）：此刻已在自己的 netns 里，
+           veth 容器端（父进程起名 vc<pid>）已被父进程迁入本 netns，
+           重命名为 eth0 后配地址与默认路由（网关 = 网桥 IP 172.20.0.1） */
+    if (o->use_net && o->veth_peer[0]) {
+        DBG("child: net config start");
+        if (nl_link_up("lo") < 0 ||
+            nl_link_rename(o->veth_peer, "eth0") < 0 ||
+            nl_addr_add("eth0", "172.20.0.2", 24) < 0 ||
+            nl_link_up("eth0") < 0 ||
+            nl_route_add_default("172.20.0.1", "eth0") < 0)
+            return 1;
+        DBG("child: net config done");
+    } else {
+        DBG("child: net config SKIPPED, veth_peer=%s", o->veth_peer);
     }
 
     /* 替换进程映像：固定 /bin/sh + 固定参数（无外部输入参与）。
@@ -329,6 +358,10 @@ int container_run(struct container_opts *o)
 
     /* 2. 建同步管道（仅 User Namespace 模式会真正用到） */
     if (pipe(o->sync_pipe) < 0) { perror("mydocker: pipe"); return -1; }
+
+    /* 2.5 预生成容器端 veth 名字：必须在 clone 之前写入结构体，
+           否则子进程的地址空间副本里看不到（fork 语义）。 */
+    snprintf(o->veth_peer, sizeof(o->veth_peer), "vc%d", getpid());
 
     /* 3. clone 出"容器进程"。
           SIGCHLD：子进程结束时给父进程发信号，waitpid 才能正常收尸；
@@ -375,7 +408,54 @@ map_fail:
         return -1;
     }
 
-    /* 6. 握手放行：映射与限额都布置完毕，子进程可以开始跑了 */
+    /* 6. 容器网络（阶段 4）：
+          宿主侧 —— bridge(mydocker0) + veth pair，把宿主端挂上桥、容器端塞进
+          子进程的 netns；子进程放行后自配 lo/eth0/地址/默认路由。
+          宿主侧这些操作动的是"真实"网络栈，必须 root（--user 模式不支持 --net）。 */
+    if (o->use_net) {
+        if (geteuid() != 0) {
+            fprintf(stderr, "mydocker: --net 需要以 root 运行（bridge 属于宿主网络栈）\n");
+            close(o->sync_pipe[1]);
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
+            free(stack);
+            return -1;
+        }
+        if (if_nametoindex("mydocker0") == 0) {
+            /* 网桥幂等创建：不存在才建，多个容器共享同一座桥 */
+            if (nl_link_create_bridge("mydocker0") == 0) {
+                nl_addr_add("mydocker0", "172.20.0.1", 24);
+            }
+        }
+        nl_link_up("mydocker0");
+        char veth_host[IFNAMSIZ];
+        snprintf(veth_host, sizeof(veth_host), "vh%d", pid);
+        DBG("net: create veth done");
+        if (nl_link_create_veth(veth_host, o->veth_peer) == 0) {
+            DBG("net: set_master");
+            nl_link_set_master(veth_host, "mydocker0");
+            nl_link_up(veth_host);
+            DBG("net: set_ns");
+            nl_link_set_ns(o->veth_peer, pid);  /* 一端进入容器 netns */
+            /* 开转发（容器出网 NAT 的前提）；失败只警告 */
+            if (write_file("/proc/sys/net/ipv4/ip_forward", "1\n") < 0)
+                fprintf(stderr, "mydocker: ip_forward 未开启，容器将无法出网\n");
+            /* 把容器端网口名传给子进程（管道保序：名字在前，放行信号在后） */
+            DBG("net: write name");
+            if (write(o->sync_pipe[1], o->veth_peer,
+                      strlen(o->veth_peer) + 1) < 0)
+                perror("mydocker: pipe write veth name");
+        } else {
+            close(o->sync_pipe[1]);
+            kill(pid, SIGKILL);
+            waitpid(pid, NULL, 0);
+            free(stack);
+            return -1;
+        }
+    }
+
+    /* 7. 握手放行：映射/限额/网络都布置完毕，子进程可以开始跑了 */
+    DBG("net: write g");
     if (write(o->sync_pipe[1], "g", 1) != 1)
         perror("mydocker: pipe write");  /* 子进程若已出错退出，写管道会 EPIPE */
     close(o->sync_pipe[1]);

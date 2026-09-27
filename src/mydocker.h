@@ -19,6 +19,8 @@ struct container_opts {
                                   upper/work/merged 自动生成在 rootfs 旁边） */
     long        memory_bytes;  /* 阶段 3：memory.max 字节数；0 = 不限制 */
     long        cpu_percent;   /* 阶段 3：cpu.max 限额百分比（1-100）；0 = 不限制 */
+    int         use_net;       /* 阶段 4：接入 mydocker0 网桥（veth + NAT 前置） */
+    char        veth_peer[16]; /* 容器侧 veth 名（父进程生成，子进程 rename 为 eth0）*/
     int         sync_pipe[2];  /* 父 -> 子 的同步管道：
                                   子进程要等父进程写好 uid/gid 映射才能继续干活，
                                   管道就是最简单的"等一下"手段 */

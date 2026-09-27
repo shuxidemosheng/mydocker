@@ -21,13 +21,14 @@ static void usage(void)
 {
     fprintf(stderr,
         "用法: mydocker run [--user] [--hostname 名字] [--rootfs 目录]\n"
-        "                   [--memory 100m] [--cpu 50] [--overlay]\n"
+        "                   [--memory 100m] [--cpu 50] [--overlay] [--net]\n"
         "  --user       免 root 模式（User Namespace + uid 映射）\n"
         "  --hostname   设置容器内主机名（默认不变）\n"
         "  --rootfs     容器根目录（scripts/build-rootfs.sh 生成）\n"
         "  --overlay    rootfs 只读 + overlayfs 可写层\n"
         "  --memory     内存限额，如 100m / 1g（cgroup v2 memory.max）\n"
-        "  --cpu        CPU 百分比 1-100（cgroup v2 cpu.max）\n");
+        "  --cpu        CPU 百分比 1-100（cgroup v2 cpu.max）\n"
+        "  --net        接入 mydocker0 网桥（veth pair，需 root）\n");
 }
 
 /* "100m" -> 字节数；支持无后缀 / k / m / g（不区分大小写） */
@@ -72,6 +73,8 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--cpu") == 0) {
             if (i + 1 >= argc) { usage(); return 2; }
             opts.cpu_percent = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--net") == 0) {
+            opts.use_net = 1;
         } else {
             usage();
             return 2;
@@ -83,6 +86,7 @@ int main(int argc, char **argv)
     opts.ns_flags = CLONE_NEWNS          /* 挂载表隔离 */
                   | CLONE_NEWPID         /* 进程号隔离 */
                   | CLONE_NEWUTS         /* 主机名隔离 */
+                  | (opts.use_net ? CLONE_NEWNET : 0)   /* 网络栈隔离 */
                   | (opts.use_user_ns ? CLONE_NEWUSER : 0);
 
     if (opts.use_overlay && !opts.rootfs) {
