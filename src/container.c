@@ -375,6 +375,28 @@ int container_run(struct container_opts *o)
     /* 父进程不再需要读端 */
     close(o->sync_pipe[0]);
 
+    /* 3.5 写容器状态文件（阶段 5）：/run/mydocker/<pid>（root）或
+           ~/.mydocker/<pid>（普通用户）。ps/exec/rm 据此发现容器。 */
+    char rundir[PATH_MAX], statefile[PATH_MAX];
+    if (geteuid() == 0)
+        snprintf(rundir, sizeof(rundir), "/run/mydocker");
+    else
+        snprintf(rundir, sizeof(rundir), "%s/.mydocker",
+                 getenv("HOME") ? getenv("HOME") : "/tmp");
+    mkdir(rundir, 0755);
+    snprintf(statefile, sizeof(statefile), "%s/%d", rundir, pid);
+    int sfd = open(statefile, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (sfd >= 0) {
+        char info[512];
+        snprintf(info, sizeof(info),
+                 "pid=%d\nhostname=%s\nveth=%s\nrootfs=%s\n",
+                 pid, o->hostname ? o->hostname : "-", o->veth_peer,
+                 o->rootfs ? o->rootfs : "-");
+        ssize_t ignore = write(sfd, info, strlen(info));
+        (void)ignore;
+        close(sfd);
+    }
+
     /* 4. User Namespace 模式：写 uid/gid 映射，把"外面的我"映射成"里面的 root"。
           映射文件每行格式： <Namespace内的id> <外面的id> <映射数量>
           "0 1000 1" = 内部的 0号(root) 就是外面的 1000号。
@@ -440,11 +462,6 @@ map_fail:
             /* 开转发（容器出网 NAT 的前提）；失败只警告 */
             if (write_file("/proc/sys/net/ipv4/ip_forward", "1\n") < 0)
                 fprintf(stderr, "mydocker: ip_forward 未开启，容器将无法出网\n");
-            /* 把容器端网口名传给子进程（管道保序：名字在前，放行信号在后） */
-            DBG("net: write name");
-            if (write(o->sync_pipe[1], o->veth_peer,
-                      strlen(o->veth_peer) + 1) < 0)
-                perror("mydocker: pipe write veth name");
         } else {
             close(o->sync_pipe[1]);
             kill(pid, SIGKILL);
@@ -468,8 +485,9 @@ map_fail:
     }
     free(stack);
 
-    /* 8. 清理本次容器的 cgroup 组（组内已无进程，rmdir 即删） */
+    /* 8. 清理本次容器的 cgroup 组与状态文件（组内已无进程，rmdir 即删） */
     if (cgdir[0]) rmdir(cgdir);
+    unlink(statefile);
 
     if (WIFEXITED(status))  return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status); /* shell 惯例 */

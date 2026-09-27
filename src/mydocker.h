@@ -26,8 +26,13 @@ struct container_opts {
                                   管道就是最简单的"等一下"手段 */
 };
 
-/* 创建隔离进程并在其中启动 /bin/bash（阶段 1 固定行为），
-   返回值同 waitpid 语义（正常退出为 bash 的退出码） */
+/* 创建隔离进程并在其中启动 /bin/sh（阶段 1 起固定行为），
+   返回值同 waitpid 语义（正常退出为 sh 的退出码） */
 int container_run(struct container_opts *opts);
+
+/* 阶段 5 管理子命令（cli.c） */
+int cmd_ps(void);
+int cmd_exec(int argc, char **argv);
+int cmd_rm(int argc, char **argv);
 
 #endif /* MYDOCKER_H */
