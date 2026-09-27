@@ -24,6 +24,7 @@
 #include <errno.h>
 #include <fcntl.h>                      /* open() */
 #include <limits.h>                     /* PATH_MAX */
+#include <signal.h>                     /* kill(), SIGKILL */
 #include <sched.h>                      /* clone(), CLONE_NEWxxx */
 #include <stdio.h>
 #include <stdlib.h>
@@ -165,17 +166,119 @@ static int setup_rootfs(const char *rootfs)
     return 0;
 }
 
+/* ---------------- 阶段 3：cgroup v2 资源限制 ---------------- */
+
+/*
+ * cgroup v2 是"统一层级"：一颗进程树，每个目录一个组，控制器按需开启。
+ * 与 v1（每个子系统一棵独立树，memory/cpu 各挂各的）最大的不同。
+ *
+ * 本函数在父进程里执行，做四件事：
+ *   1) 定位基础组：root 下用 /sys/fs/cgroup/mydocker；
+ *      普通用户走 systemd 委派目录 user@<uid>.service（rootless 路径）。
+ *   2) 在基础组的 subtree_control 里开启 memory/cpu/pids 控制器
+ *      （v2 规则：控制器必须在"父链"上逐级开启，子组里才会出现对应接口文件）。
+ *   3) 建容器专属组 mydocker-<pid>，写 memory.max / cpu.max。
+ *      cpu.max 两列: "配额 周期"，单位微秒；50% => "50000 100000"（每 100ms 用 50ms）。
+ *   4) 把容器进程 pid 写进组的 cgroup.procs —— 从此它受这组限额约束。
+ * 组路径通过 cgdir 带回，waitpid 后由调用方清理（删目录）。
+ */
+static int cgroup_apply(const struct container_opts *o, pid_t pid,
+                        char *cgdir, size_t cglen)
+{
+    char base[PATH_MAX], path[PATH_MAX], buf[256];
+
+    if (geteuid() == 0) {
+        snprintf(base, sizeof(base), "/sys/fs/cgroup/mydocker");
+    } else {
+        /* rootless：systemd 把 user@<uid>.service 子树委派给普通用户，
+           我们只能在这棵子树里活动，越界一律 EPERM */
+        snprintf(base, sizeof(base),
+                 "/sys/fs/cgroup/user.slice/user-%d.slice/user@%d.service",
+                 geteuid(), geteuid());
+    }
+    if (mkdir(base, 0755) < 0 && errno != EEXIST) {
+        fprintf(stderr, "mydocker: cgroup mkdir %s: %s\n",
+                base, strerror(errno));
+        return -1;
+    }
+
+    /* 开启控制器：只认 cpu/memory/pids 三个，其余忽略 */
+    snprintf(path, sizeof(path), "%s/cgroup.controllers", base);
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        fprintf(stderr, "mydocker: open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n < 0) { perror("mydocker: read controllers"); return -1; }
+    buf[n] = '\0';
+
+    snprintf(path, sizeof(path), "%s/cgroup.subtree_control", base);
+    fd = open(path, O_WRONLY);
+    if (fd < 0) {
+        fprintf(stderr, "mydocker: open %s: %s\n", path, strerror(errno));
+        return -1;
+    }
+    for (char *tok = strtok(buf, " \n"); tok; tok = strtok(NULL, " \n")) {
+        if (strcmp(tok, "cpu") && strcmp(tok, "memory") && strcmp(tok, "pids"))
+            continue;
+        char enable[32];
+        snprintf(enable, sizeof(enable), "+%s", tok);
+        if (write(fd, enable, strlen(enable)) < 0) {
+            /* 已开启的控制器重复写 +xxx 会报 EINVAL？不，v2 幂等，可忽略失败 */
+            fprintf(stderr, "mydocker: enable +%.16s: %s\n",
+                    tok, strerror(errno));
+        }
+    }
+    close(fd);
+
+    /* 建容器专属组并写限额 */
+    snprintf(cgdir, cglen, "%s/mydocker-%d", base, pid);
+    if (mkdir(cgdir, 0755) < 0) {
+        fprintf(stderr, "mydocker: cgroup mkdir %s: %s\n",
+                cgdir, strerror(errno));
+        return -1;
+    }
+    if (o->memory_bytes > 0) {
+        snprintf(path, sizeof(path), "%s/memory.max", cgdir);
+        snprintf(buf, sizeof(buf), "%ld\n", o->memory_bytes);
+        if (write_file(path, buf) < 0) return -1;
+        /* swap.max=0：禁用换页兜底。否则内核会持续把匿名页换出到 swap，
+           容器实际能吃掉 max+swap 的内存，OOM 大大推迟（Docker 默认也允许
+           swap；这里为了"到额即 OOM"的清晰语义选择禁用） */
+        snprintf(path, sizeof(path), "%s/memory.swap.max", cgdir);
+        if (write_file(path, "0\n") < 0) return -1;
+    }
+    if (o->cpu_percent > 0) {
+        if (o->cpu_percent < 1 || o->cpu_percent > 100) {
+            fprintf(stderr, "mydocker: --cpu 取值 1-100\n");
+            return -1;
+        }
+        snprintf(path, sizeof(path), "%s/cpu.max", cgdir);
+        /* 配额 = 百分比 × 1000us，周期固定 100000us(100ms) */
+        snprintf(buf, sizeof(buf), "%ld 100000\n", o->cpu_percent * 1000);
+        if (write_file(path, buf) < 0) return -1;
+    }
+
+    /* 把容器进程塞进组：从此整棵子树受本组限额 */
+    snprintf(path, sizeof(path), "%s/cgroup.procs", cgdir);
+    snprintf(buf, sizeof(buf), "%d", pid);
+    if (write_file(path, buf) < 0) return -1;
+    return 0;
+}
+
 /* ---------------- 子进程入口 ---------------- */
 
 static int child_main(void *arg)
 {
     struct container_opts *o = arg;
-    char done;
 
-    /* 若启用了 User Namespace，此刻我们还没有身份映射：
-       父进程正在往 /proc/<我们的pid>/uid_map 写映射，读管道等它写完。
-       （读不到数据会阻塞，正好当"等一下"用。） */
-    if (o->ns_flags & CLONE_NEWUSER) {
+    /* 若启用了 User Namespace 或 cgroup 限额，父进程还需要做收尾工作
+       （写 uid/gid 映射、把我们的 pid 写进 cgroup 组），
+       读管道等它发"可以了"的信号，再继续干活。 */
+    {
+        char done;
         if (read(o->sync_pipe[0], &done, 1) != 1) {
             perror("mydocker: child read sync");
             return 1;
@@ -243,6 +346,7 @@ int container_run(struct container_opts *o)
           映射文件每行格式： <Namespace内的id> <外面的id> <映射数量>
           "0 1000 1" = 内部的 0号(root) 就是外面的 1000号。
           写 gid_map 前必须先向 setgroups 写 "deny"（内核规定，防止绕过组权限）。 */
+    char cgdir[PATH_MAX] = "";
     if (o->ns_flags & CLONE_NEWUSER) {
         char path[64], map[64];
         snprintf(map, sizeof(map), "0 %d 1\n", geteuid());
@@ -258,20 +362,35 @@ int container_run(struct container_opts *o)
         if (write_file(path, map) < 0) goto map_fail;
 
 map_fail:
-        /* 不管成功与否都放行子进程：失败时子进程稍后自己会因权限不足报错，
-           退出码能如实反映问题 */
-        if (write(o->sync_pipe[1], "g", 1) != 1)
-            perror("mydocker: pipe write");
+        ; /* 失败也继续放行：子进程稍后自己会因权限不足报错 */
     }
+
+    /* 5. cgroup 限额（阶段 3）：建组 -> 写限额 -> 把子进程 pid 塞进去 */
+    if ((o->memory_bytes > 0 || o->cpu_percent > 0) &&
+        cgroup_apply(o, pid, cgdir, sizeof(cgdir)) < 0) {
+        close(o->sync_pipe[1]);
+        kill(pid, SIGKILL);             /* 限额没设成就别让它裸奔 */
+        waitpid(pid, NULL, 0);
+        free(stack);
+        return -1;
+    }
+
+    /* 6. 握手放行：映射与限额都布置完毕，子进程可以开始跑了 */
+    if (write(o->sync_pipe[1], "g", 1) != 1)
+        perror("mydocker: pipe write");  /* 子进程若已出错退出，写管道会 EPIPE */
     close(o->sync_pipe[1]);
 
-    /* 5. 等容器进程退出并回收（否则它变僵尸进程挂在进程表里） */
+    /* 7. 等容器进程退出并回收（否则它变僵尸进程挂在进程表里） */
     int status = 0;
     if (waitpid(pid, &status, 0) < 0) {
         perror("mydocker: waitpid");
         return -1;
     }
     free(stack);
+
+    /* 8. 清理本次容器的 cgroup 组（组内已无进程，rmdir 即删） */
+    if (cgdir[0]) rmdir(cgdir);
+
     if (WIFEXITED(status))  return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status); /* shell 惯例 */
     return -1;

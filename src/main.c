@@ -21,9 +21,27 @@ static void usage(void)
 {
     fprintf(stderr,
         "用法: mydocker run [--user] [--hostname 名字] [--rootfs 目录]\n"
+        "                   [--memory 100m] [--cpu 50] [--overlay]\n"
         "  --user       免 root 模式（User Namespace + uid 映射）\n"
         "  --hostname   设置容器内主机名（默认不变）\n"
-        "  --rootfs     容器根目录（scripts/build-rootfs.sh 生成）\n");
+        "  --rootfs     容器根目录（scripts/build-rootfs.sh 生成）\n"
+        "  --overlay    rootfs 只读 + overlayfs 可写层\n"
+        "  --memory     内存限额，如 100m / 1g（cgroup v2 memory.max）\n"
+        "  --cpu        CPU 百分比 1-100（cgroup v2 cpu.max）\n");
+}
+
+/* "100m" -> 字节数；支持无后缀 / k / m / g（不区分大小写） */
+static long parse_size(const char *s)
+{
+    char *end;
+    long v = strtol(s, &end, 10);
+    if (end == s || v <= 0) return -1;
+    switch (*end | 0x20) {                  /* 统一转小写 */
+    case 'k': v *= 1024L;       end++; break;
+    case 'm': v *= 1024L * 1024; end++; break;
+    case 'g': v *= 1024L * 1024 * 1024; end++; break;
+    }
+    return *end == '\0' ? v : -1;
 }
 
 int main(int argc, char **argv)
@@ -44,6 +62,16 @@ int main(int argc, char **argv)
             opts.rootfs = argv[++i];
         } else if (strcmp(argv[i], "--overlay") == 0) {
             opts.use_overlay = 1;
+        } else if (strcmp(argv[i], "--memory") == 0) {
+            if (i + 1 >= argc) { usage(); return 2; }
+            opts.memory_bytes = parse_size(argv[++i]);
+            if (opts.memory_bytes <= 0) {
+                fprintf(stderr, "mydocker: 非法的 --memory 值\n");
+                return 2;
+            }
+        } else if (strcmp(argv[i], "--cpu") == 0) {
+            if (i + 1 >= argc) { usage(); return 2; }
+            opts.cpu_percent = atoi(argv[++i]);
         } else {
             usage();
             return 2;

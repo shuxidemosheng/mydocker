@@ -7,6 +7,16 @@ BIN     = mydocker
 $(BIN): $(SRC) src/*.h
 	$(CC) $(CFLAGS) -o $(BIN) $(SRC)
 
+test: test/memhog test/spin
+
+# 测试程序必须 -static：busybox rootfs 里没有 glibc 动态链接器，
+# 动态编译的二进制在容器内 execve 会报 ENOENT（"not found" 但文件明明在）
+test/memhog: test/memhog.c
+	$(CC) $(CFLAGS) -static -o $@ $<
+
+test/spin: test/spin.c
+	$(CC) $(CFLAGS) -static -o $@ $<
+
 .PHONY: clean
 clean:
-	rm -f $(BIN)
+	rm -f $(BIN) test/memhog test/spin
