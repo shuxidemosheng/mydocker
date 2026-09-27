@@ -1,0 +1,6 @@
+mydocker
+*.o
+rootfs/
+upper/
+work/
+merged/
