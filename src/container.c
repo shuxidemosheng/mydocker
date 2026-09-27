@@ -23,11 +23,15 @@
 
 #include <errno.h>
 #include <fcntl.h>                      /* open() */
+#include <limits.h>                     /* PATH_MAX */
 #include <sched.h>                      /* clone(), CLONE_NEWxxx */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>                  /* mount(), MS_NOSUID 等 */
+#include <sys/stat.h>                   /* mkdir(), mknod(), S_IFCHR */
+#include <sys/syscall.h>                /* SYS_pivot_root */
+#include <sys/sysmacros.h>              /* makedev() */
 #include <sys/wait.h>                   /* waitpid() */
 #include <unistd.h>                     /* read(), write(), execv(), sethostname() */
 
@@ -54,6 +58,113 @@ static int write_file(const char *path, const char *content)
     return 0;
 }
 
+/* ---------------- 阶段 2：切换容器根文件系统 ---------------- */
+
+/*
+ * overlayfs 分层：镜像（lower，只读）+ 容器写时复制层（upper）。
+ *   - lowerdir：我们的 rootfs，容器内无论怎么改都不会碰它；
+ *   - upperdir：所有修改落在这里（新建文件、改写文件）；
+ *   - workdir ：overlayfs 的内部工作目录，必须与 upper 同文件系统；
+ *   - merged  ：三者叠加后的"合并视图"，pivot_root 的目标就是它。
+ * 目录名直接派生自 rootfs 路径：rootfs-upper / -work / -merged。
+ */
+static int mount_overlay(const char *rootfs, char *merged, size_t mlen)
+{
+    char upper[PATH_MAX], work[PATH_MAX], mopts[PATH_MAX * 3];
+
+    snprintf(upper, sizeof(upper), "%s-upper", rootfs);
+    snprintf(work,  sizeof(work),  "%s-work",  rootfs);
+    snprintf(merged,mlen,          "%s-merged", rootfs);
+
+    const char *dirs[] = { upper, work, merged };
+    for (size_t i = 0; i < 3; i++)
+        if (mkdir(dirs[i], 0755) < 0 && errno != EEXIST) {
+            fprintf(stderr, "mydocker: mkdir %s: %s\n",
+                    dirs[i], strerror(errno));
+            return -1;
+        }
+
+    snprintf(mopts, sizeof(mopts),
+             "lowerdir=%s,upperdir=%s,workdir=%s", rootfs, upper, work);
+    if (mount("overlay", merged, "overlay", 0, mopts) < 0) {
+        fprintf(stderr, "mydocker: mount overlay: %s\n", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/*
+ * pivot_root 的最小可用流程（glibc 没有包装函数，走 syscall）：
+ *   1) bind mount 把 rootfs"钉"成挂载点（pivot_root 要求 new_root 必须是挂载点）；
+ *   2) 把整个 / 的传播属性从 shared 降为 slave（systemd 默认把 / 设为 shared，
+ *      不降级 pivot_root 会返回 EBUSY —— 这是最常见的第一个坑）；
+ *   3) chdir 进 rootfs，mkdir 一个目录用来"安置"旧根；
+ *   4) pivot_root(".", ".mydocker-old")：新根 = 当前目录，旧根整体挪到 .mydocker-old；
+ *   5) chdir("/") 后把旧根 MNT_DETACH 卸掉 —— 宿主机文件系统从此不可见。
+ * 最后挂上容器必备的三个虚拟文件系统 /proc /sys /dev。
+ */
+static int setup_rootfs(const char *rootfs)
+{
+    if (mount(rootfs, rootfs, NULL, MS_BIND | MS_REC, NULL) < 0) {
+        perror("mydocker: bind rootfs");
+        return -1;
+    }
+    if (mount(NULL, "/", NULL, MS_SLAVE | MS_REC, NULL) < 0)
+        perror("mydocker: demote / to slave");   /* 非致命，但失败时 pivot 多半 EBUSY */
+
+    if (chdir(rootfs) < 0) {
+        perror("mydocker: chdir rootfs");
+        return -1;
+    }
+    if (mkdir(".mydocker-old", 0700) < 0 && errno != EEXIST) {
+        perror("mydocker: mkdir old-root");
+        return -1;
+    }
+    if (syscall(SYS_pivot_root, ".", ".mydocker-old") < 0) {
+        perror("mydocker: pivot_root");
+        return -1;
+    }
+    if (chdir("/") < 0) {
+        perror("mydocker: chdir /");
+        return -1;
+    }
+    if (umount2(".mydocker-old", MNT_DETACH) < 0)
+        perror("mydocker: umount old root");
+
+    /* /proc：新 PID Namespace 的进程视图（带 userns 时内核强制三个安全位） */
+    if (mount("proc", "/proc", "proc",
+              MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0)
+        perror("mydocker: mount /proc");
+
+    /* /sys：内核规定 sysfs 不允许在非初始 User Namespace 里挂载，
+       rootless 模式下这里注定失败 —— 打印警告继续跑（同 podman 的取舍） */
+    if (mount("sysfs", "/sys", "sysfs",
+              MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_RDONLY, NULL) < 0)
+        fprintf(stderr, "mydocker: mount /sys skipped (%s)\n", strerror(errno));
+
+    /* /dev：容器内 tmpfs + 手工 mknod 几个基础设备节点。
+       mknod 在 userns 里允许，但打开这些节点可能被设备 cgroup 拦 —— 同样只警告。 */
+    if (mount("tmpfs", "/dev", "tmpfs",
+              MS_NOSUID | MS_NOEXEC, "mode=755,size=64m") < 0) {
+        perror("mydocker: mount /dev");
+    } else {
+        static const struct { const char *path; int major, minor; char type; } devs[] = {
+            { "/dev/null",  1, 3, 'c' }, { "/dev/zero", 1, 5, 'c' },
+            { "/dev/random",1, 8, 'c' }, { "/dev/urandom", 1, 9, 'c' },
+        };
+        for (size_t i = 0; i < sizeof(devs) / sizeof(devs[0]); i++) {
+            mode_t m = devs[i].type == 'c' ? S_IFCHR : S_IFBLK;
+            if (mknod(devs[i].path, m | 0666,
+                      makedev(devs[i].major, devs[i].minor)) < 0)
+                fprintf(stderr, "mydocker: mknod %s: %s\n",
+                        devs[i].path, strerror(errno));
+        }
+        mkdir("/dev/pts", 0755);
+        mkdir("/dev/shm", 0777);
+    }
+    return 0;
+}
+
 /* ---------------- 子进程入口 ---------------- */
 
 static int child_main(void *arg)
@@ -77,21 +188,31 @@ static int child_main(void *arg)
     if (o->hostname && sethostname(o->hostname, strlen(o->hostname)) < 0)
         perror("mydocker: sethostname");
 
-    /* 重挂 /proc：/proc 是内核按"调用者所在 PID Namespace"动态生成的，
-       但必须重新挂载一次它才会刷新成新 Namespace 的内容。
-       注意三个安全位：内核要求在带 User Namespace 的环境挂 proc
-       必须显式加 nosuid/nodev/noexec，否则返回 EPERM。 */
-    if (o->ns_flags & CLONE_NEWPID) {
+    /* 切换根文件系统（阶段 2）。--overlay 时先叠 overlayfs，pivot 进合并视图；
+       pivot 成功后 /proc 已在 setup_rootfs 内挂好；
+       未指定 rootfs 时保持阶段 1 行为：仅重挂 /proc。 */
+    if (o->rootfs) {
+        char merged[PATH_MAX];
+        const char *target = o->rootfs;
+        if (o->use_overlay) {
+            if (mount_overlay(o->rootfs, merged, sizeof(merged)) < 0)
+                return 1;
+            target = merged;
+        }
+        if (setup_rootfs(target) < 0) return 1;
+    } else if (o->ns_flags & CLONE_NEWPID) {
         if (mount("proc", "/proc", "proc",
                   MS_NOSUID | MS_NODEV | MS_NOEXEC, NULL) < 0)
             perror("mydocker: mount /proc");
     }
 
-    /* 替换进程映像：固定 /bin/bash + 固定参数（无外部输入参与）。
+    /* 替换进程映像：固定 /bin/sh + 固定参数（无外部输入参与）。
+       busybox rootfs 里 /bin/bash 不存在（busybox 无 bash applet），
+       /bin/sh 是 POSIX 标准 shell，同时兼容完整发行版 rootfs。
        成功后本行不再返回；失败才落到 perror。 */
-    char *const shell_argv[] = { "bash", NULL };
-    execv("/bin/bash", shell_argv);
-    fprintf(stderr, "mydocker: exec /bin/bash: %s\n", strerror(errno));
+    char *const shell_argv[] = { "sh", NULL };
+    execv("/bin/sh", shell_argv);
+    fprintf(stderr, "mydocker: exec /bin/sh: %s\n", strerror(errno));
     return 127;                         /* shell 惯例：127 = 命令找不到 */
 }
 

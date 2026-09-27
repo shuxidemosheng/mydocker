@@ -20,9 +20,10 @@
 static void usage(void)
 {
     fprintf(stderr,
-        "用法: mydocker run [--user] [--hostname 名字]\n"
+        "用法: mydocker run [--user] [--hostname 名字] [--rootfs 目录]\n"
         "  --user       免 root 模式（User Namespace + uid 映射）\n"
-        "  --hostname   设置容器内主机名（默认不变）\n");
+        "  --hostname   设置容器内主机名（默认不变）\n"
+        "  --rootfs     容器根目录（scripts/build-rootfs.sh 生成）\n");
 }
 
 int main(int argc, char **argv)
@@ -38,6 +39,11 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "--hostname") == 0) {
             if (i + 1 >= argc) { usage(); return 2; }
             opts.hostname = argv[++i];
+        } else if (strcmp(argv[i], "--rootfs") == 0) {
+            if (i + 1 >= argc) { usage(); return 2; }
+            opts.rootfs = argv[++i];
+        } else if (strcmp(argv[i], "--overlay") == 0) {
+            opts.use_overlay = 1;
         } else {
             usage();
             return 2;
@@ -50,6 +56,11 @@ int main(int argc, char **argv)
                   | CLONE_NEWPID         /* 进程号隔离 */
                   | CLONE_NEWUTS         /* 主机名隔离 */
                   | (opts.use_user_ns ? CLONE_NEWUSER : 0);
+
+    if (opts.use_overlay && !opts.rootfs) {
+        fprintf(stderr, "mydocker: --overlay 需要配合 --rootfs 使用\n");
+        return 2;
+    }
 
     return container_run(&opts);
 }

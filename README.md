@@ -11,7 +11,7 @@
 
 - [x] 阶段 0：环境验证（[笔记](docs/00-stage0-env.md)）
 - [x] 阶段 1：clone + Namespace 隔离进程（[笔记](docs/01-stage1-namespace.md)）
-- [ ] 阶段 2：rootfs + pivot_root + overlayfs
+- [x] 阶段 2：rootfs + pivot_root + overlayfs（[笔记](docs/02-stage2-rootfs.md)）
 - [ ] 阶段 3：cgroup v2 资源限制
 - [ ] 阶段 4：veth + bridge 容器网络
 - [ ] 阶段 5：CLI 整合
